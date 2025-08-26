@@ -1,4 +1,3 @@
-from __future__ import annotations
 import time
 import asyncio
 from collections import deque
@@ -28,9 +27,7 @@ class Filter:
 
     def __init__(self):
         self.valves = self.Valves()
-        # Track per-request session state
         self._sessions: Dict[str, Dict] = {}
-        # Track cumulative tokens by conversation_id
         self._conversation_token_totals: Dict[str, int] = {}
 
     @staticmethod
@@ -44,12 +41,12 @@ class Filter:
         total_tokens: int,
         remaining_percent: float,
         total_time: Optional[float],
+        current_response_tokens: int = None,
         is_final: bool = False,
     ) -> str:
         d = int(self.valves.decimals)
         parts = []
 
-        # For final output, use different prefix and exclude TPS(5s)
         if is_final:
             prefix = "✅ Final"
         else:
@@ -58,24 +55,28 @@ class Filter:
         if ttft is not None:
             parts.append(f"TTFT {self._fmt(ttft, d)}s")
 
-        # Only include TPS(5s) during streaming, not in final
         if tps5 is not None and not is_final:
             parts.append(f"TPS(5s) {self._fmt(tps5, d)}")
 
         if total_time is not None and total_time > 0:
             parts.append(f"Total {self._fmt(total_time, d)}s")
+
         parts.append(f"Tokens {total_tokens}")
         parts.append(f"Remaining {remaining_percent:.{d}f}%")
 
-        # Always include TTA and TRA if tokens > 0
-        if total_tokens > 0:
-            tta = total_tokens / max(total_time or 1e-6, 1e-6)
+        response_tokens = (
+            current_response_tokens
+            if current_response_tokens is not None
+            else total_tokens
+        )
+
+        if response_tokens > 0 and total_time is not None:
+            tta = response_tokens / max(total_time or 1e-6, 1e-6)
             parts.append(f"TTA {self._fmt(tta, d)}/s")
 
-        # Include TRA only if TTFT and generation time are valid
-        if ttft is not None and total_time is not None and total_tokens > 0:
+        if ttft is not None and total_time is not None and response_tokens > 0:
             gen_time = max(total_time - ttft, 1e-6)
-            tra = total_tokens / gen_time
+            tra = response_tokens / gen_time
             parts.append(f"TRA {self._fmt(tra, d)}/s")
 
         return f"{prefix}: " + "  |  ".join(parts)
@@ -86,7 +87,7 @@ class Filter:
         await emitter(
             {
                 "type": "status",
-                "data": {"description": description, "done": done},
+                "data": {"description": description, "done": done, "hidden": False},
             }
         )
 
@@ -110,7 +111,6 @@ class Filter:
             "last_ui": 0.0,
             "token_count": 0,
             "samples": deque(),
-            "warning_sent": False,  # Track warning per session
         }
         if conv_id not in self._conversation_token_totals:
             self._conversation_token_totals[conv_id] = 0
@@ -162,8 +162,9 @@ class Filter:
             S["first_token_ts"] = now
 
         conv_id = rid.split(":", 1)[0]
-        total_tokens_for_conv = self._conversation_token_totals[conv_id] + inc
-        self._conversation_token_totals[conv_id] = total_tokens_for_conv
+        total_tokens_for_conv = (
+            self._conversation_token_totals[conv_id] + S["token_count"]
+        )
 
         max_tokens = self.valves.max_context_tokens
         remaining_percent = ((max_tokens - total_tokens_for_conv) / max_tokens) * 100.0
@@ -190,6 +191,7 @@ class Filter:
                 total_tokens_for_conv,
                 remaining_percent,
                 total_time,
+                current_response_tokens=S["token_count"],
                 is_final=False,
             )
 
@@ -201,9 +203,8 @@ class Filter:
                 pass
             S["last_ui"] = now
 
-        # Trigger warning once when crossing threshold
         if warning_triggered and not S.get("warning_sent", False):
-            warn_msg = f"⚠️ Warning: Conversation is {100 - remaining_percent:.1f}% full ({total_tokens_for_conv}/{max_tokens} tokens). Consider compacting."
+            warn_msg = f"⚠️ Warning: Conversation is {threshold_pct}% complete ({total_tokens_for_conv}/{max_tokens} tokens). Consider compacting."
             try:
                 asyncio.create_task(self._emit_message(__event_emitter__, warn_msg))
             except Exception:
@@ -233,27 +234,32 @@ class Filter:
         ttft = (S["first_token_ts"] - S["start_ts"]) if S["first_token_ts"] else None
 
         conv_id = rid.split(":", 1)[0]
-        final_tokens = self._conversation_token_totals.get(conv_id, 0)
+
+        self._conversation_token_totals[conv_id] += S["token_count"]
+        final_tokens = self._conversation_token_totals[conv_id]
+
         remaining_percent = (
             (self.valves.max_context_tokens - final_tokens)
             / self.valves.max_context_tokens
         ) * 100.0
 
-        # Create final bar without TPS(5s) and with checkmark prefix
         final_bar = self._render_bar(
-            ttft, None, final_tokens, remaining_percent, total_time, is_final=True
+            ttft,
+            None,
+            final_tokens,
+            remaining_percent,
+            total_time,
+            current_response_tokens=S["token_count"],
+            is_final=True,
         )
 
-        # Emit the final status with done=True to replace the streaming status
         await self._emit_status(__event_emitter__, final_bar, done=True)
 
-        # Only show additional warning message if threshold exceeded and show_final_card is True
         threshold_pct = self.valves.warning_threshold_percent
         if self.valves.show_final_card and remaining_percent <= threshold_pct:
             warning_msg = f"📊 Context usage at {final_tokens}/{self.valves.max_context_tokens} ({remaining_percent:.1f}% remaining). Compact history to avoid overflow."
             await self._emit_message(__event_emitter__, warning_msg)
 
-        # Cleanup
         self._sessions.pop(rid, None)
 
         return body
